@@ -1,0 +1,52 @@
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define RELAY3 18
+
+// INA219 #3 at address 0x44
+Adafruit_INA219 ina219_3(0x44);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(RELAY3, OUTPUT);
+  // Relay Active-LOW: HIGH = OFF
+  digitalWrite(RELAY3, HIGH);
+
+  Serial.println("=================================");
+  Serial.println("PS06: CH3 (0x44 + GPIO 18) TEST");
+  Serial.println("=================================");
+
+  if (!ina219_3.begin()) {
+    Serial.println("ERROR: INA219 #3 not found at 0x44!");
+    while (1);
+  }
+
+  ina219_3.setCalibration_32V_2A();
+  Serial.println("SUCCESS: INA219 #3 initialized at 0x44.");
+}
+
+void loop() {
+  Serial.println("\n>>> RELAY CH3 ON (Click & LED ON) <<<");
+  digitalWrite(RELAY3, LOW);
+  delay(2000);
+
+  float v = ina219_3.getBusVoltage_V();
+  float i = ina219_3.getCurrent_mA();
+  float p = ina219_3.getPower_mW();
+
+  Serial.print("Bus Voltage: "); Serial.print(v, 2); Serial.print(" V | ");
+  Serial.print("Current: ");     Serial.print(i, 2); Serial.print(" mA | ");
+  Serial.print("Power: ");       Serial.print(p, 2); Serial.println(" mW");
+
+  delay(1000);
+
+  Serial.println("\n>>> RELAY CH3 OFF (Click & LED OFF) <<<");
+  digitalWrite(RELAY3, HIGH);
+  delay(3000);
+}
