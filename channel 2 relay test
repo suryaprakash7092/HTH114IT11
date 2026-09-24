@@ -1,0 +1,69 @@
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define RELAY2 17
+
+// INA219 #2 at address 0x41
+Adafruit_INA219 ina219_2(0x41);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(RELAY2, OUTPUT);
+  // Ensure relay starts OFF (Active-LOW: HIGH = OFF)
+  digitalWrite(RELAY2, HIGH);
+
+  Serial.println("=================================");
+  Serial.println("PS06: CH2 MOTOR + INA219 #2 TEST");
+  Serial.println("=================================");
+
+  if (!ina219_2.begin()) {
+    Serial.println("ERROR: INA219 #2 not found at 0x41!");
+    while (1);
+  }
+
+  ina219_2.setCalibration_32V_2A();
+  Serial.println("INA219 #2 initialized successfully.");
+}
+
+void loop() {
+  Serial.println("\n>>> RELAY CH2 ON: Motor should run <<<");
+  digitalWrite(RELAY2, LOW);  // Turn relay ON
+
+  // Allow motor to reach operating speed
+  delay(1500);
+
+  float voltage_on = ina219_2.getBusVoltage_V();
+  float current_on = ina219_2.getCurrent_mA();
+  float power_on   = ina219_2.getPower_mW();
+
+  Serial.println("---------------------------------");
+  Serial.print("Bus Voltage : "); Serial.print(voltage_on, 2); Serial.println(" V");
+  Serial.print("Current     : "); Serial.print(current_on, 2); Serial.println(" mA");
+  Serial.print("Power       : "); Serial.print(power_on, 2);   Serial.println(" mW");
+  Serial.println("---------------------------------");
+
+  delay(2500);
+
+  Serial.println("\n>>> RELAY CH2 OFF: Motor should stop <<<");
+  digitalWrite(RELAY2, HIGH); // Turn relay OFF
+
+  delay(1500);
+
+  float voltage_off = ina219_2.getBusVoltage_V();
+  float current_off = ina219_2.getCurrent_mA();
+  float power_off   = ina219_2.getPower_mW();
+
+  Serial.println("---------------------------------");
+  Serial.print("Bus Voltage : "); Serial.print(voltage_off, 2); Serial.println(" V");
+  Serial.print("Current     : "); Serial.print(current_off, 2); Serial.println(" mA");
+  Serial.print("Power       : "); Serial.print(power_off, 2);   Serial.println(" mW");
+  Serial.println("---------------------------------");
+
+  delay(2500);
+}
