@@ -1,0 +1,24 @@
+#define RELAY1 16
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY1, OUTPUT);
+
+  // Relay OFF initially
+  digitalWrite(RELAY1, HIGH);
+
+  Serial.println("PS06 RELAY TEST");
+  Serial.println("Relay OFF");
+}
+
+void loop() {
+
+  Serial.println("Relay ON - Fan should run");
+  digitalWrite(RELAY1, LOW);   // Most 5V relay modules are active LOW
+  delay(5000);
+
+  Serial.println("Relay OFF - Fan should stop");
+  digitalWrite(RELAY1, HIGH);
+  delay(5000);
+}
