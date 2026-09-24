@@ -1,0 +1,41 @@
+#define BTN1_PIN 25
+#define BTN2_PIN 26
+
+// Debounce timing
+unsigned long lastPressBtn1 = 0;
+unsigned long lastPressBtn2 = 0;
+const unsigned long debounceDelay = 200; // ms
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Configure pins with internal pull-up resistors
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
+
+  Serial.println("================================");
+  Serial.println("PS06: PUSH BUTTON TEST (GPIO 25 & 26)");
+  Serial.println("================================");
+  Serial.println("Press Button 1 (GPIO 25) or Button 2 (GPIO 26)...");
+}
+
+void loop() {
+  // Check Button 1
+  if (digitalRead(BTN1_PIN) == LOW) {
+    if (millis() - lastPressBtn1 > debounceDelay) {
+      Serial.println("[BUTTON 1 PRESSED] -> GPIO 25: Trigger Manual Override");
+      lastPressBtn1 = millis();
+    }
+  }
+
+  // Check Button 2
+  if (digitalRead(BTN2_PIN) == LOW) {
+    if (millis() - lastPressBtn2 > debounceDelay) {
+      Serial.println("[BUTTON 2 PRESSED] -> GPIO 26: Trigger Mode / Reset");
+      lastPressBtn2 = millis();
+    }
+  }
+
+  delay(20); // Small loop pacing
+}
