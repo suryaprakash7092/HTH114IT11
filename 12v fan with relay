@@ -1,0 +1,103 @@
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define RELAY1 16
+
+Adafruit_INA219 ina219(0x40);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Relay
+  pinMode(RELAY1, OUTPUT);
+
+  // Relay OFF initially
+  digitalWrite(RELAY1, HIGH);
+
+  // INA219
+  if (!ina219.begin()) {
+    Serial.println("INA219 NOT FOUND!");
+    while (1);
+  }
+
+  ina219.setCalibration_32V_2A();
+
+  Serial.println("================================");
+  Serial.println("PS06 CH1 FAN POWER TEST");
+  Serial.println("================================");
+}
+
+void loop() {
+
+  // ============================
+  // FAN ON
+  // ============================
+
+  Serial.println();
+  Serial.println("RELAY ON - FAN SHOULD RUN");
+
+  digitalWrite(RELAY1, LOW);
+
+  delay(2000);
+
+  float voltage = ina219.getBusVoltage_V();
+  float current = ina219.getCurrent_mA();
+  float power = ina219.getPower_mW();
+
+  Serial.println("----------------------------");
+
+  Serial.print("Bus Voltage : ");
+  Serial.print(voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Current     : ");
+  Serial.print(current, 2);
+  Serial.println(" mA");
+
+  Serial.print("Power       : ");
+  Serial.print(power, 2);
+  Serial.println(" mW");
+
+  Serial.println("----------------------------");
+
+  delay(3000);
+
+
+  // ============================
+  // FAN OFF
+  // ============================
+
+  Serial.println();
+  Serial.println("RELAY OFF - FAN SHOULD STOP");
+
+  digitalWrite(RELAY1, HIGH);
+
+  delay(2000);
+
+  voltage = ina219.getBusVoltage_V();
+  current = ina219.getCurrent_mA();
+  power = ina219.getPower_mW();
+
+  Serial.println("----------------------------");
+
+  Serial.print("Bus Voltage : ");
+  Serial.print(voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Current     : ");
+  Serial.print(current, 2);
+  Serial.println(" mA");
+
+  Serial.print("Power       : ");
+  Serial.print(power, 2);
+  Serial.println(" mW");
+
+  Serial.println("============================");
+
+  delay(3000);
+}
