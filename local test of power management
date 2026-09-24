@@ -1,0 +1,240 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_INA219.h>
+
+// I2C Pins
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Relay Pins (Active-LOW: LOW = ON, HIGH = OFF)
+#define RELAY_CH1 16 // Critical Load (Never shed)
+#define RELAY_CH2 17 // Non-Critical Load 1 (Shed 1st)
+#define RELAY_CH3 18 // Non-Critical Load 2 (Shed 2nd)
+
+// Button Pins (Active-LOW with internal pullups)
+#define BTN_OVERRIDE 25
+#define BTN_CAP_ADJ  26
+
+// OLED Setup (SH1106 128x64, address 0x3C)
+Adafruit_SH1106G display(128, 64, &Wire, -1);
+
+// INA219 Sensors
+Adafruit_INA219 ina1(0x40);
+Adafruit_INA219 ina2(0x41);
+Adafruit_INA219 ina3(0x44);
+
+// Energy & Power Variables (in mW)
+float power1 = 0, power2 = 0, power3 = 0, totalPower = 0;
+float peakCap = 6000.0; // Default: 6000 mW (6.0 W)
+
+// State Tracking
+bool state1 = true; // CH1: Critical (Always ON)
+bool state2 = true; // CH2: Non-Critical
+bool state3 = true; // CH3: Non-Critical
+bool manualOverride = false;
+bool peakExceeded = false;
+
+// Button Debounce Tracking
+unsigned long lastBtnOverride = 0;
+unsigned long lastBtnCap = 0;
+const unsigned long debounceTime = 250;
+
+// Display refresh timing
+unsigned long lastDisplayUpdate = 0;
+
+void setRelay(int pin, bool turnOn) {
+  digitalWrite(pin, turnOn ? LOW : HIGH);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Configure Relays (Start all ON)
+  pinMode(RELAY_CH1, OUTPUT);
+  pinMode(RELAY_CH2, OUTPUT);
+  pinMode(RELAY_CH3, OUTPUT);
+  setRelay(RELAY_CH1, true);
+  setRelay(RELAY_CH2, true);
+  setRelay(RELAY_CH3, true);
+
+  // Configure Buttons
+  pinMode(BTN_OVERRIDE, INPUT_PULLUP);
+  pinMode(BTN_CAP_ADJ, INPUT_PULLUP);
+
+  // Initialize OLED
+  if (!display.begin(0x3C, true)) {
+    Serial.println("OLED init failed!");
+  }
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 24);
+  display.println("PS06 INITIALIZING...");
+  display.display();
+
+  // Initialize INA219 Sensors
+  if (!ina1.begin() || !ina2.begin() || !ina3.begin()) {
+    Serial.println("Error initializing one or more INA219 sensors!");
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println("INA219 INIT ERROR!");
+    display.display();
+    while (1);
+  }
+
+  ina1.setCalibration_32V_2A();
+  ina2.setCalibration_32V_2A();
+  ina3.setCalibration_32V_2A();
+
+  Serial.println("==================================================");
+  Serial.println("PS06 PEAK-SHAVING ENERGY CONTROL SYSTEM ONLINE");
+  Serial.println("==================================================");
+}
+
+void handleButtons() {
+  // Button 1: Toggle Manual Override
+  if (digitalRead(BTN_OVERRIDE) == LOW) {
+    if (millis() - lastBtnOverride > debounceTime) {
+      manualOverride = !manualOverride;
+      if (manualOverride) {
+        // Restore all loads during manual override
+        state2 = true;
+        state3 = true;
+        setRelay(RELAY_CH2, state2);
+        setRelay(RELAY_CH3, state3);
+        Serial.println("[OVERRIDE] Manual Mode: All loads forced ON");
+      } else {
+        Serial.println("[AUTO] Returning to Automatic Peak-Shaving Mode");
+      }
+      lastBtnOverride = millis();
+    }
+  }
+
+  // Button 2: Cycle Peak Cap limit
+  if (digitalRead(BTN_CAP_ADJ) == LOW) {
+    if (millis() - lastBtnCap > debounceTime) {
+      if (peakCap == 6000.0) peakCap = 4500.0;
+      else if (peakCap == 4500.0) peakCap = 8000.0;
+      else peakCap = 6000.0;
+
+      Serial.print("[CONFIG] New Peak Cap Limit Set: ");
+      Serial.print(peakCap);
+      Serial.println(" mW");
+      lastBtnCap = millis();
+    }
+  }
+}
+
+void executePeakShavingLogic() {
+  if (manualOverride) return; // Do not shed in manual override mode
+
+  // Predictive / Real-time threshold check
+  if (totalPower > peakCap) {
+    peakExceeded = true;
+
+    // Step 1: Shed Non-Critical Load 1 (CH2)
+    if (state2) {
+      state2 = false;
+      setRelay(RELAY_CH2, false);
+      Serial.println(">>> [ALERT] Peak Exceeded! Shedding CH2 (Non-Critical 1) <<<");
+      return;
+    }
+
+    // Step 2: If still exceeding, shed Non-Critical Load 2 (CH3)
+    if (state3) {
+      state3 = false;
+      setRelay(RELAY_CH3, false);
+      Serial.println(">>> [ALERT] Still Above Cap! Shedding CH3 (Non-Critical 2) <<<");
+      return;
+    }
+  } else {
+    // Power is within safe limits (Hysteresis check: at least 2000 mW below cap to prevent flapping)
+    if (totalPower < (peakCap - 2000.0)) {
+      peakExceeded = false;
+      // Re-engage non-critical loads sequentially
+      if (!state3) {
+        state3 = true;
+        setRelay(RELAY_CH3, true);
+        Serial.println("[RESTORE] Headroom safe. Restoring CH3.");
+      } else if (!state2) {
+        state2 = true;
+        setRelay(RELAY_CH2, true);
+        Serial.println("[RESTORE] Headroom safe. Restoring CH2.");
+      }
+    }
+  }
+}
+
+void updateOLED() {
+  display.clearDisplay();
+
+  // Header Bar
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("PS06 ");
+  display.print(manualOverride ? "[MANUAL]" : "[AUTO]");
+  display.setCursor(84, 0);
+  display.print(peakExceeded ? "!SHED!" : "OK");
+  display.drawLine(0, 9, 128, 9, SH110X_WHITE);
+
+  // Total Power vs Cap
+  display.setCursor(0, 13);
+  display.print("Total: ");
+  display.print(totalPower / 1000.0, 2);
+  display.print("W / ");
+  display.print(peakCap / 1000.0, 1);
+  display.print("W");
+
+  // Load Status Rows
+  display.setCursor(0, 25);
+  display.print("CH1(Crit): ");
+  display.print(power1 / 1000.0, 2);
+  display.print("W ");
+  display.print(state1 ? "[ON]" : "[--]");
+
+  display.setCursor(0, 37);
+  display.print("CH2(Non1): ");
+  display.print(power2 / 1000.0, 2);
+  display.print("W ");
+  display.print(state2 ? "[ON]" : "[SHED]");
+
+  display.setCursor(0, 49);
+  display.print("CH3(Non2): ");
+  display.print(power3 / 1000.0, 2);
+  display.print("W ");
+  display.print(state3 ? "[ON]" : "[SHED]");
+
+  display.display();
+}
+
+void loop() {
+  handleButtons();
+
+  // Read instantaneous power from all 3 channels
+  power1 = ina1.getPower_mW();
+  power2 = ina2.getPower_mW();
+  power3 = ina3.getPower_mW();
+  totalPower = power1 + power2 + power3;
+
+  executePeakShavingLogic();
+
+  // Refresh display every 400ms
+  if (millis() - lastDisplayUpdate > 400) {
+    updateOLED();
+
+    // Serial Telemetry
+    Serial.print("P_Total: "); Serial.print(totalPower, 1); Serial.print(" mW | ");
+    Serial.print("Cap: ");     Serial.print(peakCap, 1);    Serial.print(" mW | ");
+    Serial.print("CH1: ");     Serial.print(state1 ? "ON " : "OFF ");
+    Serial.print("CH2: ");     Serial.print(state2 ? "ON " : "SHED ");
+    Serial.print("CH3: ");     Serial.println(state3 ? "ON" : "SHED");
+
+    lastDisplayUpdate = millis();
+  }
+
+  delay(50);
+}
