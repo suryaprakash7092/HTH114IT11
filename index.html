@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PS06 - AI Peak-Shaving Energy Controller</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-4 md:p-8">
+  <div class="max-w-5xl mx-auto space-y-6">
+
+    <!-- Top Header & Heartbeat Status -->
+    <header class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl">
+      <div>
+        <div class="flex items-center gap-3">
+          <span id="heartbeatDot" class="h-3.5 w-3.5 rounded-full bg-rose-500"></span>
+          <h1 class="text-xl md:text-2xl font-black text-white">AI Peak-Shaving Energy Controller</h1>
+        </div>
+        <p class="text-xs md:text-sm text-slate-400 mt-1">Edge Predictive ML & Real-Time Facility Demand Management</p>
+      </div>
+      <div id="connBadge" class="px-3.5 py-1.5 text-xs font-extrabold rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30">
+        ESP32: CONNECTING...
+      </div>
+    </header>
+
+    <!-- Top KPI Row -->
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg">
+        <span class="text-xs font-bold uppercase text-slate-400">Total Facility Load</span>
+        <div class="flex items-baseline gap-2 mt-1">
+          <span id="totalPower" class="text-4xl font-extrabold text-sky-400">0.00</span>
+          <span class="text-lg font-bold text-slate-400">Watts</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-2">Active Limit: <span id="currentCapText" class="font-bold text-slate-200">6.0 W</span></div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg">
+        <span class="text-xs font-bold uppercase text-slate-400">Grid Control Status</span>
+        <div id="shedStatus" class="text-2xl font-extrabold text-emerald-400 mt-2">WAITING...</div>
+        <div class="text-xs text-slate-400 mt-2">Protected Critical Branch: <span id="critBranchLabel" class="font-bold text-rose-400">CH1</span></div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg">
+        <span class="text-xs font-bold uppercase text-slate-400">Avoided Demand Charges</span>
+        <div class="flex items-baseline gap-2 mt-1">
+          <span id="estSavings" class="text-4xl font-extrabold text-emerald-400">$0.00</span>
+          <span class="text-xs font-semibold text-slate-400">/ mo</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-2">Avoided Peak Spikes: <span id="avoidedW" class="font-bold text-slate-200">0.00 W</span></div>
+      </div>
+    </section>
+
+    <!-- AI/ML Predictive Analytics Card -->
+    <section class="bg-gradient-to-r from-indigo-950/60 to-slate-900 border border-indigo-500/30 p-5 rounded-2xl shadow-lg">
+      <div class="flex justify-between items-center mb-3">
+        <div class="flex items-center gap-2">
+          <span class="px-2 py-0.5 text-[10px] font-black rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">AIML CORE</span>
+          <h2 class="text-sm font-bold text-white uppercase tracking-wider">Predictive Trend & Anomaly Engine</h2>
+        </div>
+        <span id="aiRiskBadge" class="text-xs font-bold px-2.5 py-1 rounded-md bg-emerald-500/20 text-emerald-300">RISK: LOW</span>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+        <div class="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
+          <span class="text-slate-400">Demand Rate of Change (&Delta;P/&Delta;t):</span>
+          <div id="aiSlope" class="text-lg font-bold text-indigo-300 mt-1">0.00 W/s</div>
+        </div>
+        <div class="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
+          <span class="text-slate-400">Predicted Load (Next 10s):</span>
+          <div id="aiForecast" class="text-lg font-bold text-sky-300 mt-1">0.00 W</div>
+        </div>
+        <div class="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
+          <span class="text-slate-400">Load Classification:</span>
+          <div id="aiAnomaly" class="text-lg font-bold text-emerald-300 mt-1">Steady State (Nominal)</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Device Branches & Manual Individual Toggles -->
+    <section class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg space-y-4">
+      <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+        <h2 class="text-base font-bold text-white">Device Branches & Manual Controls</h2>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="text-slate-400">Set Critical Load:</span>
+          <select id="critSelect" onchange="setCriticalLoad(this.value)" class="bg-slate-800 text-white font-bold px-3 py-1.5 rounded-lg border border-slate-700 outline-none">
+            <option value="1">CH1 (Main Fan)</option>
+            <option value="2">CH2 (Cooling Motor)</option>
+            <option value="3">CH3 (Secondary Load)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <!-- CH1 -->
+        <div class="p-4 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center">
+              <span class="text-xs font-bold text-slate-400">CHANNEL 1</span>
+              <span id="ch1CritBadge" class="text-[10px] font-black px-2 py-0.5 rounded bg-rose-500/20 text-rose-400">CRITICAL</span>
+            </div>
+            <div class="text-sm font-semibold text-slate-200 mt-1">Main Fan</div>
+            <div id="p1" class="text-2xl font-black text-white mt-2">0.00 W</div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-slate-800 flex justify-between items-center">
+            <span id="s1State" class="text-xs font-bold text-emerald-400">RUNNING</span>
+            <button onclick="toggleChannel(1)" class="px-3 py-1 text-xs font-bold bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition">Toggle</button>
+          </div>
+        </div>
+
+        <!-- CH2 -->
+        <div class="p-4 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center">
+              <span class="text-xs font-bold text-slate-400">CHANNEL 2</span>
+              <span id="ch2CritBadge" class="text-[10px] font-black px-2 py-0.5 rounded bg-amber-500/20 text-amber-400">FLEXIBLE</span>
+            </div>
+            <div class="text-sm font-semibold text-slate-200 mt-1">Cooling Motor</div>
+            <div id="p2" class="text-2xl font-black text-white mt-2">0.00 W</div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-slate-800 flex justify-between items-center">
+            <span id="s2State" class="text-xs font-bold text-emerald-400">RUNNING</span>
+            <button onclick="toggleChannel(2)" class="px-3 py-1 text-xs font-bold bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition">Toggle</button>
+          </div>
+        </div>
+
+        <!-- CH3 -->
+        <div class="p-4 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center">
+              <span class="text-xs font-bold text-slate-400">CHANNEL 3</span>
+              <span id="ch3CritBadge" class="text-[10px] font-black px-2 py-0.5 rounded bg-amber-500/20 text-amber-400">FLEXIBLE</span>
+            </div>
+            <div class="text-sm font-semibold text-slate-200 mt-1">Secondary Load</div>
+            <div id="p3" class="text-2xl font-black text-white mt-2">0.00 W</div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-slate-800 flex justify-between items-center">
+            <span id="s3State" class="text-xs font-bold text-emerald-400">RUNNING</span>
+            <button onclick="toggleChannel(3)" class="px-3 py-1 text-xs font-bold bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition">Toggle</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Custom Watt Input & System Quick Actions -->
+    <section class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg space-y-4">
+      <h2 class="text-base font-bold text-white">Facility Controls & Custom Limit</h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <!-- Custom Input -->
+        <div class="flex gap-2">
+          <input type="number" step="0.1" id="customCapInput" placeholder="Enter Watts (e.g. 5.5)" class="w-full bg-slate-950 border border-slate-800 px-4 py-2.5 rounded-xl text-sm font-bold text-white outline-none focus:border-sky-500 transition" />
+          <button onclick="setCustomCap()" class="px-4 py-2.5 bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold rounded-xl whitespace-nowrap transition">
+            Set Limit
+          </button>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="flex gap-2">
+          <button onclick="allowAllLoads()" class="w-full px-4 py-2.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs font-bold rounded-xl transition">
+            Allow All Loads to Run
+          </button>
+          <button onclick="resetSystem()" class="w-full px-4 py-2.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/30 text-xs font-bold rounded-xl transition">
+            Reset System
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Persistent Event History Log Table -->
+    <section class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-lg space-y-3">
+      <div class="flex justify-between items-center">
+        <h2 class="text-base font-bold text-white">Historical Event Log</h2>
+        <span class="text-xs text-slate-400">Preserved Across Resets</span>
+      </div>
+      <div class="overflow-x-auto max-h-60 overflow-y-auto">
+        <table class="w-full text-left text-xs text-slate-300">
+          <thead class="bg-slate-950 text-slate-400 uppercase font-bold sticky top-0">
+            <tr>
+              <th class="p-2.5">Date & Time</th>
+              <th class="p-2.5">Event Description</th>
+              <th class="p-2.5">Total Load</th>
+              <th class="p-2.5">Status</th>
+            </tr>
+          </thead>
+          <tbody id="historyBody" class="divide-y divide-slate-800/80">
+            <tr><td colspan="4" class="p-3 text-center text-slate-500">Loading history logs...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
+    const FIREBASE_BASE = "https://power-management-9ea49-default-rtdb.firebaseio.com/";
+    const TELEMETRY_URL = FIREBASE_BASE + "telemetry.json";
+    const COMMAND_URL   = FIREBASE_BASE + "commands.json";
+    const HISTORY_URL   = FIREBASE_BASE + "history.json";
+
+    let lastS2 = true, lastS3 = true;
+    let localStates = { s1: true, s2: true, s3: true };
+    let lastSeenCounter = 0;
+
+    async function updateDashboard() {
+      try {
+        const res = await fetch(TELEMETRY_URL);
+        if (!res.ok) throw new Error("Offline");
+        const data = await res.json();
+
+        // ESP32 Heartbeat watchdog check
+        const connBadge = document.getElementById('connBadge');
+        const dot = document.getElementById('heartbeatDot');
+        
+        if (data && data.total !== undefined && data.lastSeen !== undefined) {
+          if (data.lastSeen !== lastSeenCounter) {
+            lastSeenCounter = data.lastSeen;
+            connBadge.innerText = "ESP32: CONNECTED (LIVE)";
+            connBadge.className = "px-3.5 py-1.5 text-xs font-extrabold rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+            dot.className = "h-3.5 w-3.5 rounded-full bg-emerald-400 animate-ping";
+          }
+        } else {
+          throw new Error("No telemetry payload");
+        }
+
+        // Convert milliwatts to Watts
+        const totalW = (data.total / 1000).toFixed(2);
+        const capW   = (data.cap / 1000).toFixed(1);
+        const p1W    = (data.p1 / 1000).toFixed(2);
+        const p2W    = (data.p2 / 1000).toFixed(2);
+        const p3W    = (data.p3 / 1000).toFixed(2);
+        const avoidedW = (data.avoided / 1000).toFixed(2);
+
+        document.getElementById('totalPower').innerText = totalW;
+        document.getElementById('currentCapText').innerText = capW + " W";
+        document.getElementById('p1').innerText = p1W + " W";
+        document.getElementById('p2').innerText = p2W + " W";
+        document.getElementById('p3').innerText = p3W + " W";
+        document.getElementById('avoidedW').innerText = avoidedW + " W";
+        document.getElementById('estSavings').innerText = "$" + ((data.avoided / 1000) * 15.5).toFixed(2);
+
+        localStates.s1 = data.s1;
+        localStates.s2 = data.s2;
+        localStates.s3 = data.s3;
+
+        document.getElementById('s1State').innerText = data.s1 ? "RUNNING (ON)" : "SHED (OFF)";
+        document.getElementById('s1State').className = data.s1 ? "text-xs font-bold text-emerald-400" : "text-xs font-bold text-amber-500";
+        document.getElementById('s2State').innerText = data.s2 ? "RUNNING (ON)" : "SHED (OFF)";
+        document.getElementById('s2State').className = data.s2 ? "text-xs font-bold text-emerald-400" : "text-xs font-bold text-amber-500";
+        document.getElementById('s3State').innerText = data.s3 ? "RUNNING (ON)" : "SHED (OFF)";
+        document.getElementById('s3State').className = data.s3 ? "text-xs font-bold text-emerald-400" : "text-xs font-bold text-amber-500";
+
+        const shedBanner = document.getElementById('shedStatus');
+        if (data.override) {
+          shedBanner.innerText = "MANUAL OVERRIDE";
+          shedBanner.className = "text-2xl font-extrabold text-purple-400 mt-2";
+        } else if (data.total > data.cap) {
+          shedBanner.innerText = "PEAK EXCEEDED";
+          shedBanner.className = "text-2xl font-extrabold text-rose-500 mt-2";
+        } else if (!data.s2 || !data.s3) {
+          shedBanner.innerText = "SHEDDING ACTIVE";
+          shedBanner.className = "text-2xl font-extrabold text-amber-500 mt-2";
+        } else {
+          shedBanner.innerText = "OPTIMAL (SAFE)";
+          shedBanner.className = "text-2xl font-extrabold text-emerald-400 mt-2";
+        }
+
+        const critChan = data.criticalChannel || 1;
+        document.getElementById('critBranchLabel').innerText = "CH" + critChan;
+        document.getElementById('critSelect').value = critChan;
+        updateCritBadges(critChan);
+
+        // AIML Cards
+        const slope = data.aiSlope || 0;
+        const forecast = data.aiForecast || data.total;
+        document.getElementById('aiSlope').innerText = (slope / 1000).toFixed(2) + " W/s";
+        document.getElementById('aiForecast').innerText = (forecast / 1000).toFixed(2) + " W";
+
+        const riskBadge = document.getElementById('aiRiskBadge');
+        if (forecast > data.cap) {
+          riskBadge.innerText = "RISK: HIGH (PREDICTED SPIKE)";
+          riskBadge.className = "text-xs font-bold px-2.5 py-1 rounded-md bg-rose-500/20 text-rose-300";
+          document.getElementById('aiAnomaly').innerText = "Rapid Ramp Detected (Pre-emptive)";
+        } else {
+          riskBadge.innerText = "RISK: LOW";
+          riskBadge.className = "text-xs font-bold px-2.5 py-1 rounded-md bg-emerald-500/20 text-emerald-300";
+          document.getElementById('aiAnomaly').innerText = "Steady State (Nominal)";
+        }
+
+        // Track transitions for history
+        if (lastS2 && !data.s2) logHistoricalEvent("Channel 2 Automatically Shed", totalW + " W", "SHED");
+        if (lastS3 && !data.s3) logHistoricalEvent("Channel 3 Automatically Shed", totalW + " W", "SHED");
+        lastS2 = data.s2;
+        lastS3 = data.s3;
+
+      } catch (err) {
+        const connBadge = document.getElementById('connBadge');
+        const dot = document.getElementById('heartbeatDot');
+        connBadge.innerText = "ESP32: OFFLINE (NO SIGNAL)";
+        connBadge.className = "px-3.5 py-1.5 text-xs font-extrabold rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30";
+        dot.className = "h-3.5 w-3.5 rounded-full bg-rose-500";
+      }
+    }
+
+    function updateCritBadges(ch) {
+      for (let i = 1; i <= 3; i++) {
+        const badge = document.getElementById(`ch${i}CritBadge`);
+        if (i == ch) {
+          badge.innerText = "CRITICAL";
+          badge.className = "text-[10px] font-black px-2 py-0.5 rounded bg-rose-500/20 text-rose-400 border border-rose-500/30";
+        } else {
+          badge.innerText = "FLEXIBLE";
+          badge.className = "text-[10px] font-black px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30";
+        }
+      }
+    }
+
+    async function setCustomCap() {
+      const val = parseFloat(document.getElementById('customCapInput').value);
+      if (isNaN(val) || val <= 0) return alert("Please enter a valid wattage number!");
+      const capIn_mW = val * 1000;
+      await fetch(COMMAND_URL, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cap: capIn_mW })
+      });
+      logHistoricalEvent(`Peak Limit set to ${val} W`, `${val} W`, "CONFIG");
+      document.getElementById('customCapInput').value = "";
+    }
+
+    async function setCriticalLoad(ch) {
+      await fetch(COMMAND_URL, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ criticalChannel: parseInt(ch) })
+      });
+      logHistoricalEvent(`Critical load switched to CH${ch}`, "--", "CONFIG");
+    }
+
+    async function toggleChannel(ch) {
+      const key = `force_ch${ch}`;
+      const currentState = localStates[`s${ch}`];
+      const targetState = !currentState;
+
+      // Optimistic UI update so it responds instantly
+      localStates[`s${ch}`] = targetState;
+      const stateElem = document.getElementById(`s${ch}State`);
+      stateElem.innerText = targetState ? "RUNNING (ON)" : "SHED (OFF)";
+      stateElem.className = targetState ? "text-xs font-bold text-emerald-400" : "text-xs font-bold text-amber-500";
+
+      await fetch(COMMAND_URL, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: targetState })
+      });
+
+      logHistoricalEvent(`Manual switch on CH${ch}: turned ${targetState ? 'ON' : 'OFF'}`, "--", "MANUAL");
+    }
+
+    async function allowAllLoads() {
+      await fetch(COMMAND_URL, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allowAll: true, override: true })
+      });
+      logHistoricalEvent("Manual Force All Loads ON triggered", "--", "OVERRIDE");
+    }
+
+    async function resetSystem() {
+      await fetch(COMMAND_URL, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cap: 6000.0, override: false, allowAll: false, resetSavings: true })
+      });
+      logHistoricalEvent("System counters reset (History kept)", "--", "RESET");
+    }
+
+    async function logHistoricalEvent(description, loadStr, statusStr) {
+      const eventObj = {
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        desc: description,
+        load: loadStr,
+        status: statusStr
+      };
+      await fetch(HISTORY_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(eventObj)
+      });
+      fetchHistory();
+    }
+
+    async function fetchHistory() {
+      try {
+        const res = await fetch(HISTORY_URL);
+        const data = await res.json();
+        if (!data) return;
+        const tbody = document.getElementById('historyBody');
+        tbody.innerHTML = "";
+        
+        const entries = Object.values(data).reverse().slice(0, 15);
+        entries.forEach(row => {
+          const tr = document.createElement('tr');
+          tr.className = "border-b border-slate-800/60";
+          tr.innerHTML = `
+            <td class="p-2.5 text-slate-400 font-mono text-[11px]">${row.timestamp}</td>
+            <td class="p-2.5 font-semibold text-slate-200">${row.desc}</td>
+            <td class="p-2.5 text-sky-400 font-bold">${row.load}</td>
+            <td class="p-2.5"><span class="px-2 py-0.5 rounded text-[10px] font-black ${row.status === 'SHED' ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-800 text-slate-300'}">${row.status}</span></td>
+          `;
+          tbody.appendChild(tr);
+        });
+      } catch (e) {
+        console.error("History fetch error:", e);
+      }
+    }
+
+    setInterval(updateDashboard, 1000);
+    setInterval(fetchHistory, 5000);
+    updateDashboard();
+    fetchHistory();
+  </script>
+</body>
+</html>
