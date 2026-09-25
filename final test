@@ -1,0 +1,647 @@
+/*
+  =====================================================================
+  AI-ENABLED PEAK-SHAVING ENERGY CONTROLLER & DEMAND-SIDE MANAGEMENT
+  ESP32 DevKit V1 Firmware
+  =====================================================================
+  Hardware:
+    - 3x Adafruit INA219 (I2C: SDA=21, SCL=22) @ 0x40, 0x41, 0x44
+    - 4-Channel Relay Module, Active-LOW (CH1=16, CH2=17, CH3=18)
+    - 1.3" SH1106 OLED, I2C @ 0x3C, 128x64
+    - 2x push buttons, active-LOW internal pullup (OVERRIDE=25, CAP_ADJ=26)
+
+  Cloud:
+    - Firebase Realtime Database, REST over HTTPS
+      /telemetry.json  <- PUT  every 1.5s (device -> cloud)
+      /commands.json   -> GET  every 1.5s (cloud -> device)
+      /history.json    <- POST on logged events (device -> cloud)
+
+  Libraries required (Arduino Library Manager):
+    - WiFi (bundled with ESP32 core)
+    - HTTPClient (bundled with ESP32 core)
+    - ArduinoJson (Benoit Blanchon)
+    - Adafruit INA219
+    - Adafruit SH110X + Adafruit GFX
+  =====================================================================
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+
+// ---------------------------------------------------------------------
+// USER CONFIG
+// ---------------------------------------------------------------------
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* FIREBASE_HOST = "https://power-management-9ea49-default-rtdb.firebaseio.com";
+
+// ---------------------------------------------------------------------
+// PIN MAP
+// ---------------------------------------------------------------------
+#define SDA_PIN        21
+#define SCL_PIN        22
+
+#define RELAY_CH1      16   // Branch 1 (non-critical by default)
+#define RELAY_CH2      17   // Branch 2 (non-critical by default)
+#define RELAY_CH3      18   // Branch 3 (non-critical by default)
+
+#define BTN_OVERRIDE   25   // Active-LOW: force "Allow All Loads"
+#define BTN_CAP_ADJ    26   // Active-LOW: cycles peak cap presets
+
+#define RELAY_ON       LOW
+#define RELAY_OFF      HIGH
+
+// ---------------------------------------------------------------------
+// CONSTANTS
+// ---------------------------------------------------------------------
+const uint32_t TELEMETRY_INTERVAL_MS = 1500;
+const uint32_t COMMAND_POLL_MS       = 1500;
+const uint32_t COOLDOWN_MS           = 8000;   // mandatory rest before restore
+const float    HYSTERESIS_MARGIN_MW  = 2000.0; // restore below (cap - 2000mW)
+const float    STRICT_SHED_CAP_MW    = 4500.0; // <= this => shed immediately
+const float    DEFAULT_PEAK_CAP_MW   = 6000.0;
+const float    DEMAND_RATE_USD_PER_KW = 15.50;
+
+// AI trend-regression window
+const int      TREND_WINDOW          = 8;      // samples (~ 8 * 1.5s = 12s)
+const float    TREND_BREACH_HORIZON_S = 7.0;    // predict 5-10s ahead -> use 7s
+const uint32_t DEBOUNCE_MS           = 250;
+
+// ---------------------------------------------------------------------
+// GLOBAL OBJECTS
+// ---------------------------------------------------------------------
+Adafruit_INA219 ina1(0x40); // CH1 - Main / Fan
+Adafruit_INA219 ina2(0x41); // CH2 - Cooling Motor
+Adafruit_INA219 ina3(0x44); // CH3 - Secondary / Auxiliary
+Adafruit_SH1106G display(128, 64, &Wire, -1);
+
+// ---------------------------------------------------------------------
+// STATE
+// ---------------------------------------------------------------------
+struct Channel {
+  const char* name;
+  uint8_t relayPin;
+  Adafruit_INA219* sensor;
+  float power_mW   = 0;
+  float current_mA = 0;
+  float voltage_V  = 0;
+  bool  relayState = true;   // true = ON
+  bool  manualOverride = false; // latched by user, exempt from auto-shed
+  bool  isCritical  = false;
+  unsigned long shedTimestamp = 0;      // millis() when shed began (for restore cooldown)
+  unsigned long lastTransitionMs = 0;   // millis() of the last ON<->OFF transition (either direction)
+  bool  inCooldown  = false;
+};
+
+Channel channels[3] = {
+  {"CH1", RELAY_CH1, &ina1},
+  {"CH2", RELAY_CH2, &ina2},
+  {"CH3", RELAY_CH3, &ina3},
+};
+
+int   criticalIndex   = 0;       // which channel index is currently critical
+float peakCap_mW      = DEFAULT_PEAK_CAP_MW;
+bool  globalManualOverride = false; // "Allow All Loads to Run"
+float cumulativeAvoided_mW = 0;     // integrated avoided peak, for savings calc
+unsigned long lastSeenCounter = 0;
+unsigned long lastTelemetryPush = 0;
+unsigned long lastCommandPoll   = 0;
+unsigned long lastLoopTime      = 0;
+
+// rolling history of total power for AI trend regression
+float   trendBuffer[TREND_WINDOW];
+uint32_t trendTimestamps[TREND_WINDOW];
+int     trendIndex = 0;
+int     trendCount = 0;
+
+// AI outputs
+float   trendSlope_mW_per_s = 0;
+float   predictedPower_mW   = 0;
+bool    predictiveShedActive = false;
+String  anomalyLabel = "NORMAL";
+float   anomalyConfidence = 0.0;
+
+// button debounce
+unsigned long lastOverrideBtnMs = 0;
+unsigned long lastCapAdjBtnMs   = 0;
+const float capPresets[3] = {6000.0, 4500.0, 3000.0};
+int capPresetIndex = 0;
+
+// ---------------------------------------------------------------------
+// FORWARD DECLARATIONS
+// ---------------------------------------------------------------------
+void readSensors();
+void runPredictiveAI();
+void runAnomalyDetection(float totalPower, float dP);
+void applyLoadSheddingLogic(float totalPower);
+void handleButtons();
+void pushTelemetry();
+void pollCommands();
+void postHistoryEvent(const String& eventText);
+void updateDisplay(float totalPower);
+void setRelay(Channel &ch, bool on);
+float computeSavings();
+
+// =======================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(BTN_OVERRIDE, INPUT_PULLUP);
+  pinMode(BTN_CAP_ADJ, INPUT_PULLUP);
+
+  for (int i = 0; i < 3; i++) {
+    pinMode(channels[i].relayPin, OUTPUT);
+    digitalWrite(channels[i].relayPin, RELAY_ON); // start all ON
+    channels[i].relayState = true;
+  }
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!ina1.begin()) Serial.println("WARN: INA219 CH1 (0x40) not found");
+  if (!ina2.begin()) Serial.println("WARN: INA219 CH2 (0x41) not found");
+  if (!ina3.begin()) Serial.println("WARN: INA219 CH3 (0x44) not found");
+
+  if (!display.begin(0x3C, true)) {
+    Serial.println("WARN: SH1106 OLED not found at 0x3C");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0, 0);
+    display.println("Peak-Shaving Ctrl");
+    display.println("Booting...");
+    display.display();
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? " connected" : " FAILED (continuing offline)");
+
+  channels[criticalIndex].isCritical = true;
+
+  for (int i = 0; i < TREND_WINDOW; i++) { trendBuffer[i] = 0; trendTimestamps[i] = 0; }
+
+  lastLoopTime = millis();
+}
+
+// =======================================================================
+void loop() {
+  unsigned long now = millis();
+
+  readSensors();
+
+  float totalPower = channels[0].power_mW + channels[1].power_mW + channels[2].power_mW;
+
+  runPredictiveAI();
+
+  float dP = totalPower - (trendCount > 0 ? trendBuffer[(trendIndex - 1 + TREND_WINDOW) % TREND_WINDOW] : totalPower);
+  runAnomalyDetection(totalPower, dP);
+
+  handleButtons();
+
+  if (!globalManualOverride) {
+    applyLoadSheddingLogic(totalPower);
+  } else {
+    // Allow-all: force every relay ON, clear cooldowns
+    for (int i = 0; i < 3; i++) {
+      if (!channels[i].relayState) setRelay(channels[i], true);
+      channels[i].inCooldown = false;
+    }
+  }
+
+  updateDisplay(totalPower);
+
+  if (now - lastTelemetryPush >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryPush = now;
+    pushTelemetry();
+  }
+
+  if (now - lastCommandPoll >= COMMAND_POLL_MS) {
+    lastCommandPoll = now;
+    pollCommands();
+  }
+
+  delay(50); // small yield
+}
+
+// =======================================================================
+// SENSOR READ
+// =======================================================================
+void readSensors() {
+  for (int i = 0; i < 3; i++) {
+    Channel &ch = channels[i];
+    ch.voltage_V  = ch.sensor->getBusVoltage_V();
+    ch.current_mA = ch.sensor->getCurrent_mA();
+    ch.power_mW   = ch.sensor->getPower_mW();
+    if (ch.power_mW < 0) ch.power_mW = 0; // clamp sensor noise
+  }
+}
+
+// =======================================================================
+// EDGE AI #1: LINEAR TREND REGRESSION (rate of change predictive shed)
+// =======================================================================
+void runPredictiveAI() {
+  float totalPower = channels[0].power_mW + channels[1].power_mW + channels[2].power_mW;
+  uint32_t t = millis();
+
+  trendBuffer[trendIndex] = totalPower;
+  trendTimestamps[trendIndex] = t;
+  trendIndex = (trendIndex + 1) % TREND_WINDOW;
+  if (trendCount < TREND_WINDOW) trendCount++;
+
+  if (trendCount < 3) {
+    trendSlope_mW_per_s = 0;
+    predictedPower_mW = totalPower;
+    predictiveShedActive = false;
+    return;
+  }
+
+  // Simple least-squares linear regression over the rolling window,
+  // using elapsed seconds (relative to oldest sample) as X.
+  int n = trendCount;
+  int oldest = (trendIndex - n + TREND_WINDOW) % TREND_WINDOW;
+  uint32_t t0 = trendTimestamps[oldest];
+
+  double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+  for (int k = 0; k < n; k++) {
+    int idx = (oldest + k) % TREND_WINDOW;
+    double x = (trendTimestamps[idx] - t0) / 1000.0; // seconds
+    double y = trendBuffer[idx];
+    sumX += x; sumY += y; sumXY += x * y; sumXX += x * x;
+  }
+  double denom = (n * sumXX - sumX * sumX);
+  double slope = (fabs(denom) > 1e-6) ? (n * sumXY - sumX * sumY) / denom : 0.0;
+  double intercept = (sumY - slope * sumX) / n;
+
+  trendSlope_mW_per_s = (float)slope;
+
+  double lastX = (t - t0) / 1000.0;
+  double predictedX = lastX + TREND_BREACH_HORIZON_S;
+  predictedPower_mW = (float)(intercept + slope * predictedX);
+  if (predictedPower_mW < 0) predictedPower_mW = 0;
+
+  // Pre-emptive shed condition: rising trend that will breach cap within horizon,
+  // but we are not already over cap (that's handled by the reactive path).
+  predictiveShedActive = (trendSlope_mW_per_s > 50.0) && (predictedPower_mW > peakCap_mW) && (totalPower < peakCap_mW);
+}
+
+// =======================================================================
+// EDGE AI #2: ANOMALY / INRUSH SIGNATURE DETECTION
+// =======================================================================
+void runAnomalyDetection(float totalPower, float dP) {
+  // Heuristic signature classification based on instantaneous delta,
+  // trend slope, and current variance across channels.
+  float maxCurrent = max(channels[0].current_mA, max(channels[1].current_mA, channels[2].current_mA));
+
+  if (fabs(dP) < 150.0 && fabs(trendSlope_mW_per_s) < 80.0) {
+    anomalyLabel = "STEADY-STATE";
+    anomalyConfidence = 0.9;
+  } else if (dP > 800.0 && trendSlope_mW_per_s > 300.0) {
+    // Fast, large positive spike -> classic inductive motor inrush
+    anomalyLabel = "MOTOR INRUSH";
+    anomalyConfidence = 0.85;
+  } else if (dP < -800.0) {
+    anomalyLabel = "LOAD DROPOUT";
+    anomalyConfidence = 0.75;
+  } else if (maxCurrent > 2000.0 && fabs(trendSlope_mW_per_s) < 100.0) {
+    // High sustained current with a flat trend -> possible mechanical stall
+    anomalyLabel = "POSSIBLE STALL";
+    anomalyConfidence = 0.65;
+  } else {
+    anomalyLabel = "TRANSIENT";
+    anomalyConfidence = 0.55;
+  }
+}
+
+// =======================================================================
+// LOAD SHEDDING / RESTORATION LOGIC (hysteresis + cooldown + AI pre-emption)
+// =======================================================================
+void applyLoadSheddingLogic(float totalPower) {
+  bool strictMode = (peakCap_mW <= STRICT_SHED_CAP_MW);
+  bool overCap = (totalPower > peakCap_mW);
+  bool predictedBreach = predictiveShedActive;
+  float restoreThreshold = peakCap_mW - HYSTERESIS_MARGIN_MW;
+
+  unsigned long now = millis();
+
+  // --- SHEDDING PASS: shed non-critical, non-manual channels in sequence ---
+  if (overCap || predictedBreach) {
+    for (int i = 0; i < 3; i++) {
+      Channel &ch = channels[i];
+      if (ch.isCritical || ch.manualOverride) continue;
+      if (!ch.relayState) continue; // already off
+
+      // Minimum-dwell guard: don't shed a channel that was only just restored.
+      // Without this, restoring a load causes an instant power jump that can
+      // re-trigger the shed condition immediately, producing relay chatter.
+      if (now - ch.lastTransitionMs < COOLDOWN_MS) continue;
+
+      setRelay(ch, false);
+      ch.shedTimestamp = now;
+      ch.lastTransitionMs = now;
+      ch.inCooldown = true;
+
+      String reason = predictedBreach && !overCap ? "predictive pre-shed" : "reactive peak shed";
+      postHistoryEvent(String(ch.name) + " shed (" + reason + "), total=" + String(totalPower, 0) + "mW");
+
+      // In non-strict mode, shed one channel at a time and re-evaluate next loop.
+      // In strict mode (cap <= 4.5W) shed immediately/aggressively (all at once).
+      if (!strictMode) break;
+    }
+  }
+
+  // --- RESTORATION PASS: restore shed channels once power has fallen
+  //     below hysteresis threshold AND their cooldown has elapsed ---
+  if (totalPower < restoreThreshold && !predictedBreach) {
+    for (int i = 0; i < 3; i++) {
+      Channel &ch = channels[i];
+      if (ch.relayState) continue;            // already on
+      if (ch.manualOverride) continue;         // manual latch controls this channel
+      if (ch.inCooldown && (now - ch.shedTimestamp < COOLDOWN_MS)) continue; // still resting
+
+      setRelay(ch, true);
+      ch.inCooldown = false;
+      ch.lastTransitionMs = now;
+      postHistoryEvent(String(ch.name) + " restored, total=" + String(totalPower, 0) + "mW");
+      break; // restore one at a time to avoid inrush pile-up
+    }
+  }
+
+  // Track avoided peak for economic savings: whenever a channel is shed,
+  // accumulate its power contribution as "avoided" for this sample interval.
+  for (int i = 0; i < 3; i++) {
+    Channel &ch = channels[i];
+    if (!ch.relayState && !ch.isCritical) {
+      // approximate avoided load using last known power draw isn't available once off;
+      // instead we track avoided peak as (measured overshoot avoided) via cap delta.
+    }
+  }
+  if (overCap) {
+    float overshoot = totalPower - peakCap_mW;
+    if (overshoot > 0) cumulativeAvoided_mW += overshoot * (TELEMETRY_INTERVAL_MS / 1000.0) / 60.0; // rough mW-min accumulation guard
+  }
+}
+
+void setRelay(Channel &ch, bool on) {
+  digitalWrite(ch.relayPin, on ? RELAY_ON : RELAY_OFF);
+  ch.relayState = on;
+}
+
+// =======================================================================
+// BUTTON HANDLING
+// =======================================================================
+void handleButtons() {
+  unsigned long now = millis();
+
+  if (digitalRead(BTN_OVERRIDE) == LOW && now - lastOverrideBtnMs > DEBOUNCE_MS) {
+    lastOverrideBtnMs = now;
+    globalManualOverride = !globalManualOverride;
+    if (globalManualOverride) {
+      for (int i = 0; i < 3; i++) setRelay(channels[i], true);
+    }
+    postHistoryEvent(globalManualOverride ? "Manual override ENABLED (local button)" : "Manual override DISABLED (local button)");
+  }
+
+  if (digitalRead(BTN_CAP_ADJ) == LOW && now - lastCapAdjBtnMs > DEBOUNCE_MS) {
+    lastCapAdjBtnMs = now;
+    capPresetIndex = (capPresetIndex + 1) % 3;
+    peakCap_mW = capPresets[capPresetIndex];
+    postHistoryEvent("Peak cap adjusted (local button) -> " + String(peakCap_mW, 0) + "mW");
+  }
+}
+
+// =======================================================================
+// OLED DISPLAY
+// =======================================================================
+void updateDisplay(float totalPower) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Total: ");
+  display.print(totalPower / 1000.0, 2);
+  display.println("W");
+
+  display.print("Cap: ");
+  display.print(peakCap_mW / 1000.0, 1);
+  display.print("W  ");
+  display.println(globalManualOverride ? "[ALL-ON]" : "");
+
+  for (int i = 0; i < 3; i++) {
+    display.print(channels[i].name);
+    display.print(i == criticalIndex ? "*" : " ");
+    display.print(":");
+    display.print(channels[i].relayState ? "ON " : "OFF");
+    display.print(" ");
+    display.print(channels[i].power_mW, 0);
+    display.println("mW");
+  }
+
+  display.print("AI: ");
+  display.print(anomalyLabel);
+  display.println();
+
+  display.print("Trend: ");
+  display.print(trendSlope_mW_per_s, 0);
+  display.println("mW/s");
+
+  display.print("WiFi: ");
+  display.println(WiFi.status() == WL_CONNECTED ? "OK" : "OFFLINE");
+
+  display.display();
+}
+
+// =======================================================================
+// FIREBASE: TELEMETRY PUSH
+// =======================================================================
+void pushTelemetry() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  lastSeenCounter++;
+
+  StaticJsonDocument<1536> doc;
+  doc["lastSeen"] = lastSeenCounter;
+  doc["timestamp"] = millis();
+  doc["peakCap_mW"] = peakCap_mW;
+  doc["totalPower_mW"] = channels[0].power_mW + channels[1].power_mW + channels[2].power_mW;
+  doc["manualOverride"] = globalManualOverride;
+  doc["criticalIndex"] = criticalIndex;
+  doc["cumulativeSavingsUSD"] = computeSavings();
+
+  JsonObject ai = doc.createNestedObject("ai");
+  ai["trendSlope_mW_per_s"] = trendSlope_mW_per_s;
+  ai["predictedPower_mW"] = predictedPower_mW;
+  ai["predictiveShedActive"] = predictiveShedActive;
+  ai["anomalyLabel"] = anomalyLabel;
+  ai["anomalyConfidence"] = anomalyConfidence;
+
+  JsonArray chArr = doc.createNestedArray("channels");
+  for (int i = 0; i < 3; i++) {
+    JsonObject c = chArr.createNestedObject();
+    c["name"] = channels[i].name;
+    c["power_mW"] = channels[i].power_mW;
+    c["current_mA"] = channels[i].current_mA;
+    c["voltage_V"] = channels[i].voltage_V;
+    c["relayOn"] = channels[i].relayState;
+    c["isCritical"] = channels[i].isCritical;
+    c["manualOverride"] = channels[i].manualOverride;
+    c["inCooldown"] = channels[i].inCooldown;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + "/telemetry.json";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(payload);
+  if (code <= 0) {
+    Serial.print("Telemetry PUT failed: ");
+    Serial.println(http.errorToString(code));
+  }
+  http.end();
+}
+
+// =======================================================================
+// FIREBASE: COMMAND POLL
+// =======================================================================
+void pollCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + "/commands.json";
+  http.begin(url);
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err && !doc.isNull()) {
+
+      if (doc.containsKey("peakCap_mW")) {
+        peakCap_mW = doc["peakCap_mW"].as<float>();
+      }
+
+      if (doc.containsKey("criticalIndex")) {
+        int newCritical = doc["criticalIndex"].as<int>();
+        if (newCritical >= 0 && newCritical < 3 && newCritical != criticalIndex) {
+          channels[criticalIndex].isCritical = false;
+          criticalIndex = newCritical;
+          channels[criticalIndex].isCritical = true;
+          postHistoryEvent(String("Critical load reassigned to ") + channels[criticalIndex].name);
+        }
+      }
+
+      if (doc.containsKey("globalManualOverride")) {
+        bool newVal = doc["globalManualOverride"].as<bool>();
+        if (newVal != globalManualOverride) {
+          globalManualOverride = newVal;
+          if (globalManualOverride) {
+            for (int i = 0; i < 3; i++) setRelay(channels[i], true);
+          }
+          postHistoryEvent(globalManualOverride ? "Manual override ENABLED (dashboard)" : "Manual override DISABLED (dashboard)");
+        }
+      }
+
+      if (doc.containsKey("resetSystem") && doc["resetSystem"].as<bool>()) {
+        peakCap_mW = DEFAULT_PEAK_CAP_MW;
+        globalManualOverride = false;
+        cumulativeAvoided_mW = 0;
+        for (int i = 0; i < 3; i++) {
+          channels[i].manualOverride = false;
+          channels[i].inCooldown = false;
+          setRelay(channels[i], true);
+        }
+        postHistoryEvent("System reset (dashboard)");
+
+        // Clear the resetSystem flag so it doesn't repeat every poll
+        HTTPClient patchHttp;
+        patchHttp.begin(url);
+        patchHttp.addHeader("Content-Type", "application/json");
+        patchHttp.PATCH("{\"resetSystem\":false}");
+        patchHttp.end();
+      }
+
+      const char* forceKeys[3] = {"force_ch1", "force_ch2", "force_ch3"};
+      bool anyIndividualForce = false;
+      for (int i = 0; i < 3; i++) {
+        if (doc.containsKey(forceKeys[i])) {
+          JsonVariant v = doc[forceKeys[i]];
+          if (!v.isNull()) {
+            bool desired = v.as<bool>();
+            channels[i].manualOverride = true;
+            anyIndividualForce = true;
+            if (channels[i].relayState != desired) {
+              setRelay(channels[i], desired);
+              channels[i].lastTransitionMs = millis();
+              postHistoryEvent(String(channels[i].name) + (desired ? " forced ON (dashboard)" : " forced OFF (dashboard)"));
+            }
+          }
+        }
+      }
+
+      // A per-channel force command means the user wants direct control of that
+      // channel, which directly conflicts with "Allow All Loads to Run" mode
+      // (which otherwise forces every relay back on every loop cycle). Clear it
+      // both locally and in Firebase so the individual command actually sticks.
+      if (anyIndividualForce && globalManualOverride) {
+        globalManualOverride = false;
+        HTTPClient clearHttp;
+        clearHttp.begin(url);
+        clearHttp.addHeader("Content-Type", "application/json");
+        clearHttp.PATCH("{\"globalManualOverride\":false}");
+        clearHttp.end();
+        postHistoryEvent("Global override auto-cleared by per-channel command");
+      }
+    }
+  }
+  http.end();
+}
+
+// =======================================================================
+// FIREBASE: HISTORY LOG POST
+// =======================================================================
+void postHistoryEvent(const String& eventText) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  StaticJsonDocument<256> doc;
+  doc["event"] = eventText;
+  doc["timestamp"] = millis();
+  doc["epoch_hint"] = (uint32_t)(millis() / 1000);
+
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  String url = String(FIREBASE_HOST) + "/history.json";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.POST(payload);
+  http.end();
+
+  Serial.println("[LOG] " + eventText);
+}
+
+// =======================================================================
+// ECONOMIC SAVINGS
+// =======================================================================
+float computeSavings() {
+  // Savings ($/mo) = (avoided kW) * $15.50/kW
+  // cumulativeAvoided_mW is accumulated in mW-minutes; convert to an
+  // approximate average avoided kW contribution for the billing formula.
+  float avoided_kW = (cumulativeAvoided_mW / 1000.0);
+  return avoided_kW * DEMAND_RATE_USD_PER_KW;
+}
